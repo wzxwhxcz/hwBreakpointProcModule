@@ -115,9 +115,14 @@ jobs:
           echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
         continue-on-error: true
       
+      - name: Collect .ko files
+        run: |
+          mkdir -p ko-modules
+          find android-kernel/${{ env.OUTPUT_PATH }} -name "*.ko" -exec cp {} ko-modules/ \;
+          ls -lh ko-modules/
+      
       - name: Upload artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
           name: kernel-driver-${{ github.event.inputs.target_arch }}
-          path: |
-            android-kernel/${{ env.OUTPUT_PATH }}
+          path: ko-modules/*.ko
