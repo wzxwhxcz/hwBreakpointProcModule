@@ -81,6 +81,7 @@ jobs:
         run: |
           cd android-kernel
           echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_aarch64_modules
+          
       - name: Increase stack frame size limit
         run: |
           cd android-kernel
@@ -91,6 +92,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+          
       - name: Fix missing kprobe symbols for Android 13
         if: ${{ github.event.inputs.android_version == 13 }}
         run: |
@@ -117,12 +119,16 @@ jobs:
       
       - name: Collect .ko files
         run: |
-          mkdir -p ko-modules
-          find android-kernel/${{ env.OUTPUT_PATH }} -name "*.ko" -exec cp {} ko-modules/ \;
-          ls -lh ko-modules/
+          mkdir -p ${{ github.workspace }}/ko-modules
+          echo "Searching for .ko files in: android-kernel/${{ env.OUTPUT_PATH }}"
+          find android-kernel/${{ env.OUTPUT_PATH }} -type f -name "*.ko" -exec cp -v {} ${{ github.workspace }}/ko-modules/ \; || true
+          find android-kernel/out -type f -name "*.ko" -exec cp -v {} ${{ github.workspace }}/ko-modules/ \; || true
+          echo "Files in ko-modules directory:"
+          ls -lh ${{ github.workspace }}/ko-modules/ || echo "No .ko files found"
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
           name: kernel-driver-${{ github.event.inputs.target_arch }}
-          path: ko-modules/*.ko
+          path: ${{ github.workspace }}/ko-modules/
+          if-no-files-found: warn
