@@ -10,7 +10,7 @@ on:
         description: 'Kernel Version (e.g., 6.1)'
         required: true
       driver_name:
-        description: 'Driver Module Name (e.g., mydriver.ko)'
+        description: 'Driver Module Name (unused for upload; e.g., mydriver.ko)'
         required: true
       target_arch:
         description: 'Target Architecture (aarch64, x86_64)'
@@ -64,7 +64,6 @@ jobs:
           KROOT="$PWD"
           KERNEL_DIR="$KROOT/common"
 
-          # 目标架构映射
           case "${INPUT_ARCH}" in
             aarch64) ARCH=arm64;   TRIPLE=aarch64-linux-gnu- ;;
             x86_64)  ARCH=x86_64;  TRIPLE=x86_64-linux-gnu-  ;;
@@ -72,7 +71,7 @@ jobs:
           esac
           echo "Using ARCH=${ARCH}, TRIPLE=${TRIPLE}"
 
-          # 查找 kernel 预编译的 clang（在 repo 根目录下的 prebuilts/）
+          # Prefer AOSP prebuilt clang if available; fall back to system clang
           if compgen -G "$KROOT/prebuilts/clang/host/linux-x86/clang-*/bin/clang" > /dev/null; then
             CLANG_BIN_DIR=$(ls -d "$KROOT"/prebuilts/clang/host/linux-x86/clang-*/bin | sort | tail -n 1)
             echo "Using prebuilt clang: $CLANG_BIN_DIR"
@@ -81,12 +80,11 @@ jobs:
             export LLVM_IAS=1
             export CLANG_TRIPLE="${TRIPLE}"
           else
-            echo "Prebuilt clang not found, falling back to system clang"
+            echo "Prebuilt clang not found, using system clang"
             export LLVM=1
             export LLVM_IAS=1
           fi
 
-          # 选择 defconfig（优先 gki_defconfig，不存在则回退到 defconfig）
           if [ -f "$KERNEL_DIR/arch/${ARCH}/configs/gki_defconfig" ]; then
             DEFCONFIG=gki_defconfig
           elif [ -f "$KERNEL_DIR/arch/${ARCH}/configs/defconfig" ]; then
@@ -97,38 +95,30 @@ jobs:
           fi
           echo "Using DEFCONFIG=${DEFCONFIG}"
 
-          # 输出目录
           KOUT="$KROOT/out/${ARCH}"
           mkdir -p "$KOUT"
 
-          # 生成配置并准备内核头
           make -C "$KERNEL_DIR" -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" "${DEFCONFIG}"
           make -C "$KERNEL_DIR" -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" prepare modules_prepare
-
-          # 只编译你的模块
           make -C "$KERNEL_DIR" -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" M=drivers/kerneldriver modules
 
-          # 保存结果路径
           echo "KO_DIR=$KOUT/drivers/kerneldriver" >> $GITHUB_ENV
 
-      - name: Verify and list built .ko
+      - name: Ensure at least one .ko exists
         run: |
           set -e
-          DRIVER="${{ github.event.inputs.driver_name }}"
-          BASE="${DRIVER%.ko}"
           echo "Listing KO_DIR: ${KO_DIR}"
           ls -al "${KO_DIR}" || true
-          if ! find "${KO_DIR}" -maxdepth 1 -type f -name "${DRIVER}" | grep -q .; then
-            echo "::error::${DRIVER} not found in ${KO_DIR}. Ensure kerneldriver/Makefile contains: 'obj-m += ${BASE}.o' and the source file(s) compile."
-            echo "Available .ko:"
-            find "${KO_DIR}" -type f -name '*.ko' -print || true
+          # 至少要有一个 .ko
+          if ! find "${KO_DIR}" -maxdepth 1 -type f -name '*.ko' | grep -q .; then
+            echo "::error::No .ko built in ${KO_DIR}. Check kerneldriver/Makefile (should contain 'obj-m += <name>.o') and sources."
             exit 1
           fi
 
-      - name: Upload driver .ko only
+      - name: Upload .ko files only
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: ${{ github.event.inputs.driver_name }}-${{ github.event.inputs.target_arch }}
+          name: kerneldriver-ko-${{ github.event.inputs.target_arch }}
           path: |
-            ${{ env.KO_DIR }}/${{ github.event.inputs.driver_name }}
+            ${{ env.KO_DIR }}/*.ko
           if-no-files-found: error
