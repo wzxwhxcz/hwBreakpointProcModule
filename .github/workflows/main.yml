@@ -39,8 +39,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential flex bison libssl-dev libelf-dev bc python-is-python3 gawk rsync ccache \
-            clang lld llvm binutils-aarch64-linux-gnu
+            build-essential flex bison libssl-dev libelf-dev bc python3 python-is-python3 gawk rsync ccache \
+            clang lld llvm binutils-aarch64-linux-gnu \
+            dwarves unifdef libncurses-dev pkg-config \
+            zstd lz4 xz-utils cpio tar unzip file git
           sudo apt-get clean
 
       - name: Set up Android Kernel source
@@ -55,7 +57,7 @@ jobs:
           mkdir -p common/drivers/kerneldriver
           cp -r ../kerneldriver/* common/drivers/kerneldriver/ 2>/dev/null || true
 
-      - name: Build module only with Kbuild (no Bazel)
+      - name: Setup build env
         env:
           INPUT_ARCH: ${{ github.event.inputs.target_arch }}
         run: |
@@ -69,21 +71,6 @@ jobs:
             x86_64)  ARCH=x86_64;  TRIPLE=x86_64-linux-gnu-  ;;
             *) echo "Unsupported target_arch: ${INPUT_ARCH}"; exit 1 ;;
           esac
-          echo "Using ARCH=${ARCH}, TRIPLE=${TRIPLE}"
-
-          # Prefer AOSP prebuilt clang if available; fall back to system clang
-          if compgen -G "$KROOT/prebuilts/clang/host/linux-x86/clang-*/bin/clang" > /dev/null; then
-            CLANG_BIN_DIR=$(ls -d "$KROOT"/prebuilts/clang/host/linux-x86/clang-*/bin | sort | tail -n 1)
-            echo "Using prebuilt clang: $CLANG_BIN_DIR"
-            export PATH="$CLANG_BIN_DIR:$PATH"
-            export LLVM=1
-            export LLVM_IAS=1
-            export CLANG_TRIPLE="${TRIPLE}"
-          else
-            echo "Prebuilt clang not found, using system clang"
-            export LLVM=1
-            export LLVM_IAS=1
-          fi
 
           if [ -f "$KERNEL_DIR/arch/${ARCH}/configs/gki_defconfig" ]; then
             DEFCONFIG=gki_defconfig
@@ -93,25 +80,63 @@ jobs:
             echo "No defconfig found for ARCH=${ARCH}"
             exit 1
           fi
-          echo "Using DEFCONFIG=${DEFCONFIG}"
 
-          KOUT="$KROOT/out/${ARCH}"
+          if compgen -G "$KROOT/prebuilts/clang/host/linux-x86/clang-*/bin/clang" > /dev/null; then
+            CLANG_BIN_DIR=$(ls -d "$KROOT"/prebuilts/clang/host/linux-x86/clang-*/bin | sort | tail -n 1)
+            echo "PATH=$CLANG_BIN_DIR:$PATH" >> $GITHUB_ENV
+          fi
+
+          echo "ARCH=$ARCH" >> $GITHUB_ENV
+          echo "TRIPLE=$TRIPLE" >> $GITHUB_ENV
+          echo "KROOT=$KROOT" >> $GITHUB_ENV
+          echo "KERNEL_DIR=$KERNEL_DIR" >> $GITHUB_ENV
+          echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
+          echo "KOUT=$KROOT/out/${ARCH}" >> $GITHUB_ENV
+          echo "KO_DIR=$KROOT/out/${ARCH}/drivers/kerneldriver" >> $GITHUB_ENV
+          echo "LLVM=1" >> $GITHUB_ENV
+          echo "LLVM_IAS=1" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=$TRIPLE" >> $GITHUB_ENV
+          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "KBUILD_VERBOSE=1" >> $GITHUB_ENV
+
+      - name: Kernel defconfig
+        run: |
+          set -xeo pipefail
           mkdir -p "$KOUT"
+          make -C "$KERNEL_DIR" -j"$(nproc)" \
+            ARCH="${ARCH}" O="${KOUT}" \
+            LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" LD="${LD}" \
+            HOSTCC=clang HOSTCXX=clang++ \
+            "${DEFCONFIG}" 2>&1 | tee -a "$KROOT/build.log"
 
-          make -C "$KERNEL_DIR" -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" "${DEFCONFIG}"
-          make -C "$KERNEL_DIR" -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" prepare modules_prepare
-          make -C "$KERNEL_DIR" -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" M=drivers/kerneldriver modules
+      - name: Modules prepare
+        run: |
+          set -xeo pipefail
+          make -C "$KERNEL_DIR" -j"$(nproc)" \
+            ARCH="${ARCH}" O="${KOUT}" \
+            LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" LD="${LD}" \
+            HOSTCC=clang HOSTCXX=clang++ \
+            prepare modules_prepare 2>&1 | tee -a "$KROOT/build.log"
 
-          echo "KO_DIR=$KOUT/drivers/kerneldriver" >> $GITHUB_ENV
+      - name: Build module only
+        run: |
+          set -xeo pipefail
+          make -C "$KERNEL_DIR" -j"$(nproc)" \
+            ARCH="${ARCH}" O="${KOUT}" \
+            LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" LD="${LD}" \
+            HOSTCC=clang HOSTCXX=clang++ \
+            M=drivers/kerneldriver modules 2>&1 | tee -a "$KROOT/build.log"
 
       - name: Ensure at least one .ko exists
         run: |
           set -e
           echo "Listing KO_DIR: ${KO_DIR}"
           ls -al "${KO_DIR}" || true
-          # 至少要有一个 .ko
           if ! find "${KO_DIR}" -maxdepth 1 -type f -name '*.ko' | grep -q .; then
-            echo "::error::No .ko built in ${KO_DIR}. Check kerneldriver/Makefile (should contain 'obj-m += <name>.o') and sources."
+            echo "::error::No .ko built in ${KO_DIR}. See build.log artifact for details."
             exit 1
           fi
 
@@ -122,3 +147,11 @@ jobs:
           path: |
             ${{ env.KO_DIR }}/*.ko
           if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: build-log-${{ github.run_id }}
+          path: ${{ env.KROOT }}/build.log
+          if-no-files-found: warn
