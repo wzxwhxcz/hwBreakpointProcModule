@@ -1,4 +1,4 @@
-name: Android Kernel Driver Builder
+name: Android Kernel Driver Builder (module-only)
 
 on:
   workflow_dispatch:
@@ -13,23 +13,24 @@ on:
         description: 'Driver Module Name (e.g., mydriver.ko)'
         required: true
       target_arch:
-        description: 'Target Architecture (aarch64, x86_64, etc.)'
+        description: 'Target Architecture (aarch64, x86_64)'
         required: true
         default: 'aarch64'
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4.2.2
-        
+
       - name: Prepare kerneldriver directory
         run: |
           mkdir -p kerneldriver
+          # 允许空 code 目录，不报错
           mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/ 2>/dev/null || true
-          
+
       - name: Install repo tool
         run: |
           sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
@@ -38,7 +39,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 gawk unzip
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 gawk rsync ccache
 
       - name: Set up Android Kernel source
         run: |
@@ -52,126 +53,59 @@ jobs:
           mkdir -p common/drivers/kerneldriver
           cp -r ../kerneldriver/* common/drivers/kerneldriver/ 2>/dev/null || true
 
-      - name: Modify Makefile to build as module (obj-m)
-        run: |
-          cd android-kernel
-          # 以模块方式构建该子目录，确保会产出 .ko
-          grep -q "obj-m \+= kerneldriver/" common/drivers/Makefile || echo "obj-m += kerneldriver/" >> common/drivers/Makefile
-
-      - name: Add module to GKI modules list (Android > 13)
-        if: ${{ fromJSON(github.event.inputs.android_version) > 13 }}
-        run: |
-          cd android-kernel
-          MODULE_NAME="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
-          # 将模块加入 GKI 模块打包列表，确保会被打进 modules*.tar.gz
-          awk -i inplace -v module="$MODULE_NAME" '
-            BEGIN { added=0 }
-            /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
-            in_list && /\]/ {
-              if (!added) {
-                print "    \"" module "\","
-                added=1
-              }
-              in_list=0
-            }
-            in_list && !added {
-              if (module < $0) {
-                print "    \"" module "\","
-                added=1
-              }
-            }
-            { print }
-          ' common/modules.bzl
-          
-      - name: Prepare module list for legacy builds (Android <= 13)
-        if: ${{ fromJSON(github.event.inputs.android_version) <= 13 }}
-        run: |
-          cd android-kernel
-          echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_${{ github.event.inputs.target_arch }}_modules || \
-          echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_aarch64_modules
-
-      - name: Increase stack frame size limit
-        run: |
-          cd android-kernel
-          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
-          grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
-
-      - name: Fix missing kprobe symbols for Android 13
-        if: ${{ fromJSON(github.event.inputs.android_version) == 13 }}
-        run: |
-          cd android-kernel
-          for symbol in register_kprobe unregister_kprobe; do
-            grep -q "$symbol" common/android/abi_gki_${{ github.event.inputs.target_arch }} || \
-            echo "$symbol" >> common/android/abi_gki_${{ github.event.inputs.target_arch }}
-          done
-          sed -i '/EXPORT_SYMBOL(unregister_kprobe);/a EXPORT_SYMBOL(register_kprobe);' common/kernel/kprobes.c
-          
-      - name: Build kernel/module
+      - name: Build module only with Kbuild (no Bazel)
+        env:
+          INPUT_ARCH: ${{ github.event.inputs.target_arch }}
+          DRIVER_NAME: ${{ github.event.inputs.driver_name }}
         run: |
           set -e
-          cd android-kernel
-          if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
-            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j"$(nproc)"
-            DIST_DIR="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
-          else
-            echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
-            tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist
-            DIST_DIR="out/kernel_${{ github.event.inputs.target_arch }}/dist"
-          fi
-          echo "DIST_DIR=$DIST_DIR" >> $GITHUB_ENV
+          cd android-kernel/common
 
-      - name: Extract built .ko from dist archives
+          # 目标架构映射
+          case "${INPUT_ARCH}" in
+            aarch64) ARCH=arm64;   TRIPLE=aarch64-linux-gnu- ;;
+            x86_64)  ARCH=x86_64;  TRIPLE=x86_64-linux-gnu-  ;;
+            *) echo "Unsupported target_arch: ${INPUT_ARCH}"; exit 1 ;;
+          esac
+          echo "Using ARCH=${ARCH}, TRIPLE=${TRIPLE}"
+
+          # 选择最新的 clang 预编译工具链
+          CLANG_BIN_DIR=$(ls -d prebuilts/clang/host/linux-x86/clang-*/bin | sort | tail -n 1)
+          if [ -z "$CLANG_BIN_DIR" ] || [ ! -d "$CLANG_BIN_DIR" ]; then
+            echo "Clang prebuilts not found"; exit 1
+          fi
+          export PATH="$PWD/$CLANG_BIN_DIR:$PATH"
+
+          # 输出目录
+          KOUT="$PWD/../out/${ARCH}"
+          mkdir -p "$KOUT"
+
+          # 生成最小构建所需的头文件和配置
+          make -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM=1 LLVM_IAS=1 gki_defconfig
+          make -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM=1 LLVM_IAS=1 prepare modules_prepare
+
+          # 只编译你的模块
+          make -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM=1 LLVM_IAS=1 M=drivers/kerneldriver modules
+
+          # 保存结果路径
+          echo "KO_DIR=$KOUT/drivers/kerneldriver" >> $GITHUB_ENV
+
+      - name: Verify and list built .ko
         run: |
           set -e
-          cd android-kernel
-          echo "Using DIST_DIR=${DIST_DIR}"
-          mkdir -p "${DIST_DIR}/modules_extracted"
-          shopt -s nullglob
-          found_archive=0
-          for f in "${DIST_DIR}"/*modules*.tar.gz "${DIST_DIR}"/modules.tar.gz; do
-            if [ -f "$f" ]; then
-              echo "Extracting $f ..."
-              tar -xzf "$f" -C "${DIST_DIR}/modules_extracted"
-              found_archive=1
-            fi
-          done
-          # 有些场景 bazel 产出 zip
-          for z in "${DIST_DIR}"/*modules*.zip; do
-            if [ -f "$z" ]; then
-              echo "Unzipping $z ..."
-              unzip -o "$z" -d "${DIST_DIR}/modules_extracted" >/dev/null
-              found_archive=1
-            fi
-          done
-          if [ "$found_archive" -eq 0 ]; then
-            echo "No module archives found in ${DIST_DIR}"
+          echo "Listing KO_DIR: ${KO_DIR}"
+          ls -al "${KO_DIR}" || true
+          if ! find "${KO_DIR}" -maxdepth 1 -type f -name "${{ github.event.inputs.driver_name }}" | grep -q .; then
+            echo "::error::${{ github.event.inputs.driver_name }} not found in ${KO_DIR}. Ensure kerneldriver/Makefile has 'obj-m += ${${{ github.event.inputs.driver_name }}%.ko}.o' and file names match."
+            echo "Available .ko:"
+            find "${KO_DIR}" -type f -name '*.ko' -print || true
+            exit 1
           fi
-          echo "List extracted modules (if any):"
-          find "${DIST_DIR}/modules_extracted" -type f -name '*.ko' -print || true
-
-      - name: Verify desired .ko exists
-        run: |
-          set -e
-          cd android-kernel
-          DRIVER="${{ github.event.inputs.driver_name }}"
-          if [ -f "${DIST_DIR}/modules_extracted/${DRIVER}" ]; then
-            echo "Found ${DRIVER} at modules_extracted root."
-            exit 0
-          fi
-          # 常见目录：lib/modules/<release>/extra 或 updates
-          if find "${DIST_DIR}/modules_extracted" -type f -name "${DRIVER}" | grep -q .; then
-            echo "Found ${DRIVER} inside extracted tree."
-            exit 0
-          fi
-          echo "Did not find ${DRIVER}. Listing available .ko for debugging:"
-          find "${DIST_DIR}/modules_extracted" -type f -name '*.ko' -print || true
-          echo "::error::${DRIVER} not found. Please ensure the subdir Makefile builds a module with the same name (obj-m += ${DRIVER%.ko}.o) and that the module is added to the GKI modules list."
-          exit 1
 
       - name: Upload driver .ko only
         uses: actions/upload-artifact@v4.6.2
         with:
           name: ${{ github.event.inputs.driver_name }}-${{ github.event.inputs.target_arch }}
           path: |
-            android-kernel/${{ env.DIST_DIR }}/modules_extracted/**/${{ github.event.inputs.driver_name }}
+            ${{ env.KO_DIR }}/${{ github.event.inputs.driver_name }}
           if-no-files-found: error
