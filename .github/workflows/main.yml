@@ -28,7 +28,6 @@ jobs:
       - name: Prepare kerneldriver directory
         run: |
           mkdir -p kerneldriver
-          # 允许空 code 目录，不报错
           mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/ 2>/dev/null || true
 
       - name: Install repo tool
@@ -39,7 +38,10 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 gawk rsync ccache
+          sudo apt-get install -y \
+            build-essential flex bison libssl-dev libelf-dev bc python-is-python3 gawk rsync ccache \
+            clang lld llvm binutils-aarch64-linux-gnu
+          sudo apt-get clean
 
       - name: Set up Android Kernel source
         run: |
@@ -56,10 +58,11 @@ jobs:
       - name: Build module only with Kbuild (no Bazel)
         env:
           INPUT_ARCH: ${{ github.event.inputs.target_arch }}
-          DRIVER_NAME: ${{ github.event.inputs.driver_name }}
         run: |
           set -e
-          cd android-kernel/common
+          cd android-kernel
+          KROOT="$PWD"
+          KERNEL_DIR="$KROOT/common"
 
           # 目标架构映射
           case "${INPUT_ARCH}" in
@@ -69,23 +72,41 @@ jobs:
           esac
           echo "Using ARCH=${ARCH}, TRIPLE=${TRIPLE}"
 
-          # 选择最新的 clang 预编译工具链
-          CLANG_BIN_DIR=$(ls -d prebuilts/clang/host/linux-x86/clang-*/bin | sort | tail -n 1)
-          if [ -z "$CLANG_BIN_DIR" ] || [ ! -d "$CLANG_BIN_DIR" ]; then
-            echo "Clang prebuilts not found"; exit 1
+          # 查找 kernel 预编译的 clang（在 repo 根目录下的 prebuilts/）
+          if compgen -G "$KROOT/prebuilts/clang/host/linux-x86/clang-*/bin/clang" > /dev/null; then
+            CLANG_BIN_DIR=$(ls -d "$KROOT"/prebuilts/clang/host/linux-x86/clang-*/bin | sort | tail -n 1)
+            echo "Using prebuilt clang: $CLANG_BIN_DIR"
+            export PATH="$CLANG_BIN_DIR:$PATH"
+            export LLVM=1
+            export LLVM_IAS=1
+            export CLANG_TRIPLE="${TRIPLE}"
+          else
+            echo "Prebuilt clang not found, falling back to system clang"
+            export LLVM=1
+            export LLVM_IAS=1
           fi
-          export PATH="$PWD/$CLANG_BIN_DIR:$PATH"
+
+          # 选择 defconfig（优先 gki_defconfig，不存在则回退到 defconfig）
+          if [ -f "$KERNEL_DIR/arch/${ARCH}/configs/gki_defconfig" ]; then
+            DEFCONFIG=gki_defconfig
+          elif [ -f "$KERNEL_DIR/arch/${ARCH}/configs/defconfig" ]; then
+            DEFCONFIG=defconfig
+          else
+            echo "No defconfig found for ARCH=${ARCH}"
+            exit 1
+          fi
+          echo "Using DEFCONFIG=${DEFCONFIG}"
 
           # 输出目录
-          KOUT="$PWD/../out/${ARCH}"
+          KOUT="$KROOT/out/${ARCH}"
           mkdir -p "$KOUT"
 
-          # 生成最小构建所需的头文件和配置
-          make -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM=1 LLVM_IAS=1 gki_defconfig
-          make -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM=1 LLVM_IAS=1 prepare modules_prepare
+          # 生成配置并准备内核头
+          make -C "$KERNEL_DIR" -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" "${DEFCONFIG}"
+          make -C "$KERNEL_DIR" -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" prepare modules_prepare
 
           # 只编译你的模块
-          make -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM=1 LLVM_IAS=1 M=drivers/kerneldriver modules
+          make -C "$KERNEL_DIR" -j"$(nproc)" ARCH="${ARCH}" O="${KOUT}" LLVM="${LLVM}" LLVM_IAS="${LLVM_IAS}" M=drivers/kerneldriver modules
 
           # 保存结果路径
           echo "KO_DIR=$KOUT/drivers/kerneldriver" >> $GITHUB_ENV
@@ -93,10 +114,12 @@ jobs:
       - name: Verify and list built .ko
         run: |
           set -e
+          DRIVER="${{ github.event.inputs.driver_name }}"
+          BASE="${DRIVER%.ko}"
           echo "Listing KO_DIR: ${KO_DIR}"
           ls -al "${KO_DIR}" || true
-          if ! find "${KO_DIR}" -maxdepth 1 -type f -name "${{ github.event.inputs.driver_name }}" | grep -q .; then
-            echo "::error::${{ github.event.inputs.driver_name }} not found in ${KO_DIR}. Ensure kerneldriver/Makefile has 'obj-m += ${${{ github.event.inputs.driver_name }}%.ko}.o' and file names match."
+          if ! find "${KO_DIR}" -maxdepth 1 -type f -name "${DRIVER}" | grep -q .; then
+            echo "::error::${DRIVER} not found in ${KO_DIR}. Ensure kerneldriver/Makefile contains: 'obj-m += ${BASE}.o' and the source file(s) compile."
             echo "Available .ko:"
             find "${KO_DIR}" -type f -name '*.ko' -print || true
             exit 1
