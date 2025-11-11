@@ -1,3 +1,4 @@
+
 name: Android Kernel Driver Builder
 
 on:
@@ -27,7 +28,7 @@ jobs:
         
       - name: Prepare kerneldriver directory
         run: |
-          mkdir kerneldriver
+          mkdir -p kerneldriver
           mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
           
       - name: Install repo tool
@@ -41,22 +42,27 @@ jobs:
           repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
           repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
 
-      - name: Copy kerneldriver
+      - name: Copy kerneldriver into tree
         run: |
           cd android-kernel
-          cp -r ../kerneldriver common/drivers
+          mkdir -p common/drivers/kerneldriver
+          cp -r ../kerneldriver/* common/drivers/kerneldriver/
 
-      - name: Modify Makefile
+      - name: Modify Makefile to build as module (obj-m)
         run: |
           cd android-kernel
-          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
+          grep -q "obj-m \+= kerneldriver/" common/drivers/Makefile || echo "obj-m += kerneldriver/" >> common/drivers/Makefile
 
-      - name: Add module to GKI modules list
-        if: ${{ github.event.inputs.android_version > 13 }}
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3 gawk
+
+      - name: Add module to GKI modules list (Android > 13)
+        if: ${{ fromJSON(github.event.inputs.android_version) > 13 }}
         run: |
           cd android-kernel
           MODULE_NAME="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
-          
           awk -i inplace -v module="$MODULE_NAME" '
             BEGIN { added=0 }
             /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
@@ -76,25 +82,20 @@ jobs:
             { print }
           ' common/modules.bzl
           
-      - name: Prepare module list for legacy builds
-        if: ${{ github.event.inputs.android_version <= 13 }}
+      - name: Prepare module list for legacy builds (Android <= 13)
+        if: ${{ fromJSON(github.event.inputs.android_version) <= 13 }}
         run: |
           cd android-kernel
-          echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_aarch64_modules
-          
+          echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_${{ github.event.inputs.target_arch }}_modules
+
       - name: Increase stack frame size limit
         run: |
           cd android-kernel
           find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
           grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
-          
       - name: Fix missing kprobe symbols for Android 13
-        if: ${{ github.event.inputs.android_version == 13 }}
+        if: ${{ fromJSON(github.event.inputs.android_version) == 13 }}
         run: |
           cd android-kernel
           for symbol in register_kprobe unregister_kprobe; do
@@ -103,11 +104,11 @@ jobs:
           done
           sed -i '/EXPORT_SYMBOL(unregister_kprobe);/a EXPORT_SYMBOL(register_kprobe);' common/kernel/kprobes.c
           
-      - name: Build kernel module
+      - name: Build kernel/module
         run: |
           cd android-kernel
           if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
-            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
+            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j"$(nproc)"
             OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
           else
             echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
@@ -117,18 +118,10 @@ jobs:
           echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
         continue-on-error: true
       
-      - name: Collect .ko files
-        run: |
-          mkdir -p ${{ github.workspace }}/ko-modules
-          echo "Searching for .ko files in: android-kernel/${{ env.OUTPUT_PATH }}"
-          find android-kernel/${{ env.OUTPUT_PATH }} -type f -name "*.ko" -exec cp -v {} ${{ github.workspace }}/ko-modules/ \; || true
-          find android-kernel/out -type f -name "*.ko" -exec cp -v {} ${{ github.workspace }}/ko-modules/ \; || true
-          echo "Files in ko-modules directory:"
-          ls -lh ${{ github.workspace }}/ko-modules/ || echo "No .ko files found"
-      
-      - name: Upload artifacts
+      - name: Upload driver .ko only
         uses: actions/upload-artifact@v4.6.2
         with:
-          name: kernel-driver-${{ github.event.inputs.target_arch }}
-          path: ${{ github.workspace }}/ko-modules/
-          if-no-files-found: warn
+          name: ${{ github.event.inputs.driver_name }}-${{ github.event.inputs.target_arch }}
+          path: |
+            android-kernel/**/${{ github.event.inputs.driver_name }}
+          if-no-files-found: error
